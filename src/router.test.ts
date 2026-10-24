@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, test, expect } from "vitest";
 import {
+  applyEnabledOverrides,
   buildOrders,
   daysOfCover,
   expandLines,
@@ -322,6 +323,43 @@ describe("routeOrder", () => {
     const { orders } = buildOrders(events);
     const order = orders.find((o) => o.orderNumber === "#2037")!;
     expect(routeOrder(order, warehouses, zones, catalog).reserve).toBeNull();
+  });
+});
+
+describe("applyEnabledOverrides", () => {
+  test("overrides enabled on copies, leaving the input alone", () => {
+    const { warehouses: overridden, warnings } = applyEnabledOverrides(warehouses, { "WH-NV": false });
+    expect(overridden.find((w) => w.code === "WH-NV")?.enabled).toBe(false);
+    expect(overridden.find((w) => w.code === "WH-NJ")?.enabled).toBe(true);
+    expect(warehouses.find((w) => w.code === "WH-NV")?.enabled).toBe(true);
+    expect(warnings).toEqual([]);
+  });
+
+  test("warns about an unknown warehouse code", () => {
+    expect(applyEnabledOverrides(warehouses, { "WH-XX": false }).warnings).toHaveLength(1);
+  });
+});
+
+describe("routeAll with WH-NV disabled (Part B, question 1)", () => {
+  const { orders } = buildOrders(events);
+  const noNv = applyEnabledOverrides(warehouses, { "WH-NV": false }).warehouses;
+  const byOrder = new Map(routeAll(orders, noNv, zones, catalog).map((r) => [r.orderNumber, r]));
+
+  test.each([
+    ["#2033", "WH-NJ", 3],
+    ["#2037", "PARTNER", null],
+    ["#2040", "WH-GA", 5],
+    ["#2041", "WH-GA", 7],
+    ["#2045", "WH-GA", 3],
+    ["#2050", "WH-NJ", 5],
+    ["#2051", "WH-GA", 7], // takes GA's last VITD
+    ["#2056", "PARTNER", null], // cascade from #2051: GA has no VITD left, NJ no MAG
+  ])("%s -> %s zone %s", (orderNumber, destination, zone) => {
+    expect(byOrder.get(orderNumber)).toMatchObject({ destination, zone });
+  });
+
+  test("no order is routed to WH-NV", () => {
+    expect([...byOrder.values()].some((r) => r.destination === "WH-NV")).toBe(false);
   });
 });
 

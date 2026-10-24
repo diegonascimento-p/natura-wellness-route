@@ -51,6 +51,22 @@ export function normalizeSku(sku: string): string {
   return sku.trim().toUpperCase();
 }
 
+// Returns copies of the warehouses with `enabled` replaced per override, for when
+// the config is stale (e.g. WH-NV still enabled after the water damage).
+export function applyEnabledOverrides(
+  warehouses: Warehouse[],
+  overrides: Record<string, boolean>,
+): { warehouses: Warehouse[]; warnings: string[] } {
+  const known = new Set(warehouses.map((w) => w.code));
+  const warnings = Object.keys(overrides)
+    .filter((code) => !known.has(code))
+    .map((code) => `override for unknown warehouse ${code} ignored`);
+  return {
+    warehouses: warehouses.map((w) => ({ ...w, enabled: overrides[w.code] ?? w.enabled })),
+    warnings,
+  };
+}
+
 export function parseZones(raw: Record<string, unknown>): Zones {
   // Keep only warehouse tables; drops "_note" and any other non-object metadata.
   const zones: Zones = {};
