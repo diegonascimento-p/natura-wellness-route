@@ -22,7 +22,17 @@ export type Catalog = {
   bundles: { sku: string; components: Line[] }[];
 };
 
+export type RouteResult = {
+  orderNumber: string;
+  destination: string; // warehouse code or PARTNER
+  zone: number | null;
+  reason: string;
+  needsReview: boolean; // domestic order that still ended up at the international partner
+};
+
+export const PARTNER = "PARTNER";
 export const EDIT_WINDOW_MINUTES = 30;
+const PRIORITY = ["WH-NJ", "WH-GA", "WH-NV", "WH-TX"];
 
 export function normalizeZip(zip: unknown): { zip: string | null; prefix: string | null; note?: string } {
   // A numeric ZIP lost its leading zeros when it was serialized; restore them.
@@ -131,4 +141,114 @@ export function expandLines(
     }
   }
   return { items, unknownSkus, notes };
+}
+
+// Smallest available / velocity across the order's SKUs. Null when any velocity is
+// missing or zero: the cover is unknown, and the warehouse ranks last on this tiebreak.
+export function daysOfCover(warehouse: Warehouse, items: Map<string, number>): number | null {
+  let cover = Infinity;
+  for (const sku of items.keys()) {
+    const stock = warehouse.inventory[sku];
+    if (!stock || !(stock.dailyVelocity > 0)) return null;
+    cover = Math.min(cover, stock.available / stock.dailyVelocity);
+  }
+  return Number.isFinite(cover) ? cover : null;
+}
+
+function canFulfil(warehouse: Warehouse, items: Map<string, number>): boolean {
+  for (const [sku, quantity] of items) {
+    if ((warehouse.inventory[sku]?.available ?? 0) < quantity) return false;
+  }
+  return true;
+}
+
+function priorityRank(code: string): number {
+  const index = PRIORITY.indexOf(code);
+  return index === -1 ? PRIORITY.length : index;
+}
+
+// More cover sorts first; unknown (null) cover sorts after any known value, and two unknowns tie.
+function compareCover(a: number | null, b: number | null): number {
+  if (a === null && b === null) return 0;
+  if (a === null) return 1;
+  if (b === null) return -1;
+  return b - a;
+}
+
+const formatCover = (cover: number | null) => (cover === null ? "unknown" : cover.toFixed(2));
+
+// `reserve` holds the expanded items that were stock-checked, set only when a warehouse was picked.
+export type RouteDecision = { result: RouteResult; reserve: Map<string, number> | null };
+
+export function routeOrder(order: Order, warehouses: Warehouse[], zones: Zones, catalog: Catalog): RouteDecision {
+  const partner = (reason: string, needsReview: boolean): RouteDecision => ({
+    result: { orderNumber: order.orderNumber, destination: PARTNER, zone: null, reason, needsReview },
+    reserve: null,
+  });
+
+  const country = order.shipTo.country?.trim().toUpperCase();
+  if (!country) return partner("no country", true);
+  if (country !== "US") return partner(`non-US destination (${country})`, false);
+
+  const zip = normalizeZip(order.shipTo.zip);
+  const notes = zip.note ? [zip.note] : [];
+  if (!zip.prefix) return partner("no ZIP", true);
+  if (!Object.values(zones).some((table) => table?.[zip.prefix!] !== undefined)) {
+    return partner([`ZIP prefix ${zip.prefix} not in zones`, ...notes].join("; "), true);
+  }
+
+  const expanded = expandLines(order.lines, catalog);
+  notes.push(...expanded.notes);
+  if (expanded.unknownSkus.length > 0) {
+    return partner([`unknown SKU ${expanded.unknownSkus.join(", ")}`, ...notes].join("; "), true);
+  }
+
+  const candidates = warehouses
+    .filter((w) => w.enabled && canFulfil(w, expanded.items))
+    .flatMap((w) => {
+      const zone = zones[w.code]?.[zip.prefix!];
+      return zone === undefined ? [] : [{ warehouse: w, zone, cover: daysOfCover(w, expanded.items) }];
+    });
+  if (candidates.length === 0) {
+    return partner(["no enabled warehouse has stock for the whole order", ...notes].join("; "), true);
+  }
+
+  candidates.sort(
+    (a, b) =>
+      a.zone - b.zone ||
+      compareCover(a.cover, b.cover) ||
+      priorityRank(a.warehouse.code) - priorityRank(b.warehouse.code),
+  );
+  const [best, runnerUp] = candidates as [(typeof candidates)[number], ...typeof candidates];
+
+  let reason = `zone ${best.zone}`;
+  if (runnerUp && runnerUp.zone === best.zone) {
+    reason +=
+      runnerUp.cover === best.cover
+        ? ` (tie with ${runnerUp.warehouse.code}, broken by priority)`
+        : ` (tie with ${runnerUp.warehouse.code}, more days of cover: ${formatCover(best.cover)} vs ${formatCover(runnerUp.cover)})`;
+  }
+  return {
+    result: {
+      orderNumber: order.orderNumber,
+      destination: best.warehouse.code,
+      zone: best.zone,
+      reason: [reason, ...notes].join("; "),
+      needsReview: false,
+    },
+    reserve: expanded.items,
+  };
+}
+
+// Routes in the given order, reserving stock as it goes. Works on a copy of the inventory.
+export function routeAll(orders: Order[], warehouses: Warehouse[], zones: Zones, catalog: Catalog): RouteResult[] {
+  const stock: Warehouse[] = structuredClone(warehouses);
+  return orders.map((order) => {
+    const { result, reserve } = routeOrder(order, stock, zones, catalog);
+    const warehouse = stock.find((w) => w.code === result.destination);
+    if (warehouse && reserve) {
+      for (const [sku, quantity] of reserve) warehouse.inventory[sku]!.available -= quantity;
+    }
+    return result;
+  });
 }

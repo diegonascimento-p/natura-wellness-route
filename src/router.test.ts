@@ -1,12 +1,22 @@
 import { readFileSync } from "node:fs";
 import { describe, test, expect } from "vitest";
-import { buildOrders, expandLines, normalizeSku, normalizeZip, parseZones } from "./router.js";
-import type { Catalog, OrderEvent } from "./router.js";
+import {
+  buildOrders,
+  daysOfCover,
+  expandLines,
+  normalizeSku,
+  normalizeZip,
+  parseZones,
+  routeAll,
+  routeOrder,
+} from "./router.js";
+import type { Catalog, OrderEvent, Warehouse } from "./router.js";
 
 const load = <T>(name: string): T =>
   JSON.parse(readFileSync(new URL(`../data/${name}`, import.meta.url), "utf8")) as T;
 
 const catalog = load<Catalog>("catalog.json");
+const warehouses = load<Warehouse[]>("warehouses.json");
 const zones = parseZones(load<Record<string, unknown>>("zones.json"));
 const events = load<OrderEvent[]>("orders.json");
 
@@ -116,6 +126,202 @@ describe("buildOrders", () => {
       created("#1", "2026-10-20T13:00:00.000Z"),
     ]);
     expect(orders.map((o) => o.orderNumber)).toEqual(["#1", "#2"]);
+  });
+});
+
+describe("daysOfCover", () => {
+  test("is the smallest available / velocity across the order's SKUs", () => {
+    const nj = warehouses.find((w) => w.code === "WH-NJ")!;
+    const items = new Map([
+      ["NW-VITD-60", 1],
+      ["NW-MAG-90", 1],
+    ]);
+    expect(daysOfCover(nj, items)).toBeCloseTo(0.1); // MAG 2/20, not VITD 400/40
+  });
+
+  test("returns null for zero velocity instead of Infinity or NaN (WH-TX)", () => {
+    const tx = warehouses.find((w) => w.code === "WH-TX")!;
+    expect(daysOfCover(tx, new Map([["NW-VITD-60", 1]]))).toBeNull();
+  });
+});
+
+describe("routeAll on the real data (hand-traced)", () => {
+  const { orders } = buildOrders(events);
+  const results = routeAll(orders, warehouses, zones, catalog);
+  const byOrder = new Map(results.map((r) => [r.orderNumber, r]));
+
+  test("routes every order exactly once", () => {
+    expect(results).toHaveLength(26);
+    expect(byOrder.size).toBe(26);
+  });
+
+  test.each([
+    ["#2031", "WH-NJ", 1],
+    ["#2032", "WH-GA", 1],
+    ["#2033", "WH-NJ", 3], // padded ZIP
+    ["#2034", "WH-GA", 5], // tie with NJ, GA has more cover
+    ["#2035", "WH-GA", 4], // GA VITD 4 -> 3
+    ["#2036", "WH-NV", 2],
+    ["#2038", "WH-NV", 4],
+    ["#2039", "WH-NJ", 1], // ZIP+4; uses NJ's last 2 MAG
+    ["#2040", "WH-GA", 5], // bundle; NJ out of MAG; GA VITD 3 -> 2
+    ["#2041", "WH-GA", 7], // merged edit; NV has no MULTI; GA VITD 2 -> 1
+    ["#2043", "WH-NV", 3],
+    ["#2044", "WH-GA", 6],
+    ["#2045", "WH-GA", 3], // lowercase SKU
+    ["#2047", "WH-GA", 4],
+    ["#2048", "WH-NJ", 5], // tie with GA, NJ has more cover
+    ["#2049", "WH-GA", 4],
+    ["#2050", "WH-NJ", 5], // cascade: GA has 1 VITD left, needs 2
+    ["#2051", "WH-NV", 2], // NV still enabled in Part A
+    ["#2052", "WH-NV", 5],
+    ["#2053", "WH-NJ", 2],
+    ["#2054", "WH-GA", 4],
+    ["#2055", "WH-GA", 8], // tie with NJ, GA has more cover
+    ["#2056", "WH-GA", 5], // bundle; NJ out of MAG
+  ])("%s -> %s zone %i", (orderNumber, destination, zone) => {
+    expect(byOrder.get(orderNumber)).toMatchObject({ destination, zone });
+  });
+
+  test("mentions normalizations in the reason", () => {
+    expect(byOrder.get("#2033")?.reason).toMatch(/02134/);
+    expect(byOrder.get("#2045")?.reason).toMatch(/nw-mag-90/);
+  });
+
+  test.each([["#2040"], ["#2056"]])("%s notes the bundle expansion", (orderNumber) => {
+    expect(byOrder.get(orderNumber)?.reason).toMatch(/bundle NW-BNDL-ESS x1 expanded to NW-VITD-60 x1 \+ NW-MAG-90 x1/);
+  });
+
+  test.each([
+    ["#2037", /non-US/, false],
+    ["#2042", /968/, true],
+    ["#2046", /no ZIP/, true],
+  ])("%s -> PARTNER", (orderNumber, reason, needsReview) => {
+    const r = byOrder.get(orderNumber);
+    expect(r).toMatchObject({ destination: "PARTNER", zone: null, needsReview });
+    expect(r?.reason).toMatch(reason);
+  });
+
+  test("does not mutate the input warehouses", () => {
+    expect(warehouses.find((w) => w.code === "WH-GA")?.inventory["NW-VITD-60"]?.available).toBe(4);
+  });
+});
+
+describe("routeAll edge cases", () => {
+  test("cascade: without #2041's edit, #2050 gets GA's VITD at zone 1", () => {
+    const lateEdit = events.map((e) =>
+      e.type === "order_edited" ? { ...e, at: "2026-10-20T14:30:00.000Z" } : e,
+    );
+    const { orders } = buildOrders(lateEdit);
+    const byOrder = new Map(routeAll(orders, warehouses, zones, catalog).map((r) => [r.orderNumber, r]));
+    expect(byOrder.get("#2041")).toMatchObject({ destination: "WH-NV", zone: 2 });
+    expect(byOrder.get("#2050")).toMatchObject({ destination: "WH-GA", zone: 1 });
+  });
+
+  test("unknown SKU goes to PARTNER with a distinct reason", () => {
+    const { orders } = buildOrders([
+      {
+        type: "order_created",
+        orderNumber: "#1",
+        at: "2026-10-20T13:00:00.000Z",
+        shipTo: { country: "US", zip: "07030" },
+        lines: [{ sku: "NW-FAKE-1", quantity: 1 }],
+      },
+    ]);
+    const [r] = routeAll(orders, warehouses, zones, catalog);
+    expect(r).toMatchObject({ destination: "PARTNER", needsReview: true });
+    expect(r?.reason).toMatch(/unknown SKU/);
+  });
+
+  test("no warehouse with full stock goes to PARTNER", () => {
+    const { orders } = buildOrders([
+      {
+        type: "order_created",
+        orderNumber: "#1",
+        at: "2026-10-20T13:00:00.000Z",
+        shipTo: { country: "US", zip: "07030" },
+        lines: [{ sku: "NW-MULTI-30", quantity: 10_000 }],
+      },
+    ]);
+    const [r] = routeAll(orders, warehouses, zones, catalog);
+    expect(r).toMatchObject({ destination: "PARTNER", zone: null });
+    expect(r?.reason).toMatch(/stock/);
+  });
+
+  test("falls back to priority NJ, GA, NV, TX when zone and cover tie", () => {
+    const twins: Warehouse[] = ["WH-NV", "WH-GA"].map((code) => ({
+      code,
+      city: "",
+      enabled: true,
+      inventory: { "NW-VITD-60": { available: 10, dailyVelocity: 1 } },
+    }));
+    const flat = { "WH-NV": { "070": 3 }, "WH-GA": { "070": 3 } };
+    const { orders } = buildOrders([
+      {
+        type: "order_created",
+        orderNumber: "#1",
+        at: "2026-10-20T13:00:00.000Z",
+        shipTo: { country: "US", zip: "07030" },
+        lines: [{ sku: "NW-VITD-60", quantity: 1 }],
+      },
+    ]);
+    expect(routeAll(orders, twins, flat, catalog)[0]?.destination).toBe("WH-GA");
+  });
+
+  test("falls back to priority when both tied warehouses have unknown cover", () => {
+    const twins: Warehouse[] = ["WH-TX", "WH-NV"].map((code) => ({
+      code,
+      city: "",
+      enabled: true,
+      inventory: { "NW-VITD-60": { available: 10, dailyVelocity: 0 } },
+    }));
+    const flat = { "WH-TX": { "070": 3 }, "WH-NV": { "070": 3 } };
+    const { orders } = buildOrders([
+      {
+        type: "order_created",
+        orderNumber: "#1",
+        at: "2026-10-20T13:00:00.000Z",
+        shipTo: { country: "US", zip: "07030" },
+        lines: [{ sku: "NW-VITD-60", quantity: 1 }],
+      },
+    ]);
+    const [r] = routeAll(orders, twins, flat, catalog);
+    expect(r?.destination).toBe("WH-NV");
+    expect(r?.reason).toMatch(/priority/);
+  });
+
+  test("known cover beats unknown cover in a zone tie", () => {
+    const twins: Warehouse[] = [
+      { code: "WH-NJ", city: "", enabled: true, inventory: { "NW-VITD-60": { available: 10, dailyVelocity: 0 } } },
+      { code: "WH-TX", city: "", enabled: true, inventory: { "NW-VITD-60": { available: 1, dailyVelocity: 100 } } },
+    ];
+    const flat = { "WH-NJ": { "070": 3 }, "WH-TX": { "070": 3 } };
+    const { orders } = buildOrders([
+      {
+        type: "order_created",
+        orderNumber: "#1",
+        at: "2026-10-20T13:00:00.000Z",
+        shipTo: { country: "US", zip: "07030" },
+        lines: [{ sku: "NW-VITD-60", quantity: 1 }],
+      },
+    ]);
+    expect(routeAll(orders, twins, flat, catalog)[0]?.destination).toBe("WH-TX");
+  });
+});
+
+describe("routeOrder", () => {
+  test("returns the expanded items it checked, for the reservation", () => {
+    const { orders } = buildOrders(events);
+    const order = orders.find((o) => o.orderNumber === "#2040")!;
+    const { result, reserve } = routeOrder(order, warehouses, zones, catalog);
+    expect(result.destination).not.toBe("PARTNER");
+    expect(Object.fromEntries(reserve!)).toEqual({ "NW-VITD-60": 1, "NW-MAG-90": 1 });
+  });
+
+  test("reserves nothing when the order goes to PARTNER", () => {
+    const { orders } = buildOrders(events);
+    const order = orders.find((o) => o.orderNumber === "#2037")!;
+    expect(routeOrder(order, warehouses, zones, catalog).reserve).toBeNull();
   });
 });
 
