@@ -252,3 +252,8 @@ export function routeAll(orders: Order[], warehouses: Warehouse[], zones: Zones,
     return result;
   });
 }
+
+export function formatRoute(result: RouteResult): string {
+  const review = result.needsReview ? "  [REVIEW: domestic order sent to partner]" : "";
+  return `${result.orderNumber.padEnd(7)}${result.destination.padEnd(9)}${result.reason}${review}`;
+}

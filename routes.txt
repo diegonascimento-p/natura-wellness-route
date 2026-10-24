@@ -1,0 +1,26 @@
+#2031  WH-NJ    zone 1
+#2032  WH-GA    zone 1
+#2033  WH-NJ    zone 3; ZIP 2134 padded to 02134
+#2034  WH-GA    zone 5 (tie with WH-NJ, more days of cover: 10.00 vs 0.10)
+#2035  WH-GA    zone 4
+#2036  WH-NV    zone 2
+#2037  PARTNER  non-US destination (CA)
+#2038  WH-NV    zone 4
+#2039  WH-NJ    zone 1
+#2040  WH-GA    zone 5; bundle NW-BNDL-ESS x1 expanded to NW-VITD-60 x1 + NW-MAG-90 x1
+#2041  WH-GA    zone 7
+#2042  PARTNER  ZIP prefix 968 not in zones  [REVIEW: domestic order sent to partner]
+#2043  WH-NV    zone 3
+#2044  WH-GA    zone 6
+#2045  WH-GA    zone 3; SKU nw-mag-90 read as NW-MAG-90
+#2046  PARTNER  no ZIP  [REVIEW: domestic order sent to partner]
+#2047  WH-GA    zone 4
+#2048  WH-NJ    zone 5 (tie with WH-GA, more days of cover: 9.95 vs 0.03)
+#2049  WH-GA    zone 4
+#2050  WH-NJ    zone 5
+#2051  WH-NV    zone 2
+#2052  WH-NV    zone 5
+#2053  WH-NJ    zone 2
+#2054  WH-GA    zone 4
+#2055  WH-GA    zone 8 (tie with WH-NJ, more days of cover: 11.76 vs 3.97)
+#2056  WH-GA    zone 5; bundle NW-BNDL-ESS x1 expanded to NW-VITD-60 x1 + NW-MAG-90 x1
